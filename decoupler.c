@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <locale.h>
 #include <netdb.h>
@@ -32,49 +33,64 @@ const char *listen_addr = "127.0.0.1";
 int listen_port = 5555;
 const char *write_addr = "127.0.0.1";
 int write_port = 5000;
-serve_t serve_policy=serve_last;
+serve_t serve_policy=serve_last; // todo: option for selecting serve_first instead
 
-static bool connected = false;
-static int epfd, serverfd;
-static struct epoll_event servere;
+static int epfd, sigfd, serverfd=-1, listenfd=-1, connfd=-1, clientfd=-1;
+static struct epoll_event servere, listene, sige, conne, cliente;
 
-static int make_sockets() {
-	int listenfd;
-	struct sockaddr_in name;
-	listenfd=socket(PF_INET, SOCK_STREAM, 0); /* Create the socket. */
-	if(listenfd<0) {
-		perror ("socket");
-		exit (EXIT_FAILURE);
-	}
-	name.sin_family = AF_INET; /* Give the socket a name. */
-	name.sin_port = htons (listen_port);
-	name.sin_addr.s_addr = htonl (INADDR_ANY);
-	if (bind (listenfd, (struct sockaddr *) &name, sizeof (name)) < 0) {
-		perror ("bind");
-		exit (EXIT_FAILURE);
-	}
+void set_nonblock(int fd)
+{
+	int fl;
+	int x;
+	fl = fcntl(fd, F_GETFL, 0);
+	if(fl<0) return;
+	fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+static void create_listener() {
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	listenfd=socket(PF_INET, SOCK_STREAM, 0);
+	exit_on_error(listenfd, "socket");
+	set_nonblock(listenfd);
+	sa.sin_family=AF_INET;
+	sa.sin_addr.s_addr=inet_addr(listen_addr); /* sa.sin_addr.s_addr=htonl(INADDR_ANY); - RFU to listen on all interfaces */
+	sa.sin_port=htons(listen_port);
+	int ret=bind(listenfd, (struct sockaddr*)&sa, sizeof(sa));
+	exit_on_error(ret, "bind");
+	uint32_t on=1;
+	setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 	struct linger a;
 	a.l_onoff=0;
 	a.l_linger=0;
 	setsockopt(listenfd, SOL_SOCKET, SO_LINGER, &a, sizeof(a));
-	return listenfd;
+	ret=listen(listenfd, 1);
+	exit_on_error(ret, "listen");
+	listene.events = EPOLLIN;
+	listene.data.fd = listenfd;
+	epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &listene);
 }
 
-static void make_socketc() {
-	if(connected)
+static void create_client() {
+	if(serverfd>=0)
 		return;
 	struct sockaddr_in serv_addr = {0};
 	serverfd=socket(PF_INET, SOCK_STREAM, 0); /* Create the socket. */
-	if(serverfd<0) {
-		perror ("socket");
-		exit (EXIT_FAILURE);
-	}
+	exit_on_error(serverfd,"socket");
 	serv_addr.sin_family = AF_INET;
 	serv_addr.sin_port = htons(write_port);
-	if(inet_pton(AF_INET, write_addr, &serv_addr.sin_addr)<=0)
+	if(inet_pton(AF_INET, write_addr, &serv_addr.sin_addr)<=0) {
+		close(serverfd);
+		serverfd=-1;
 		return;
-	if(connect(serverfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr))<0)
+	}
+	if(connect(serverfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr))<0) {
+		close(serverfd);
+		serverfd=-1;
 		return;
+	}
+	uint32_t on=1;
+	setsockopt(serverfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 	struct linger a;
 	a.l_onoff=0;
 	a.l_linger=0;
@@ -82,23 +98,28 @@ static void make_socketc() {
 	servere.events=EPOLLERR|EPOLLRDHUP|EPOLLHUP;
 	servere.data.fd=serverfd;
 	epoll_ctl(epfd, EPOLL_CTL_ADD, serverfd, &servere);
-	connected=true;
+}
+
+static void disconnect_server() {
+	epoll_ctl(epfd, EPOLL_CTL_DEL, serverfd, &servere);
+	close(serverfd);
+	serverfd=-1;
 }
 
 static void resend(char *buffer, int nbytes) {
-	make_socketc();
-	if(!connected)
-		return; /* and buffer discarded */
+	create_client();
+	if(serverfd<0) return; /* buffer discarded */
 	int ret;
 	bool finished=false;
 	while(!finished) {
-		ret=write(serverfd,buffer, nbytes);
+		ret=write(serverfd, buffer, nbytes);
 		if(ret<=0) {
-			close(serverfd);
-			connected=false;
+			disconnect_server();
 			finished=true;
-		} else if(ret<nbytes)
-			nbytes-=ret; /* and not finished */
+		} else if(ret<nbytes) {
+			buffer += ret;
+			nbytes-=ret;
+		}
 		else
 			finished=true;
 	}
@@ -114,58 +135,73 @@ static int read_from_client (int filedes) {
 	return 0;
 }
 
-int main(int argc, char *argv[]) {
-	set_parameters(argc, argv);
-	dbg("%s %s", PROGRAM_NAME, PROGRAM_VERSION);
-	int sigfd, listenfd, connfd=-1, clientfd=-1;
-	struct epoll_event sige, listene, conne, cliente;
-	epfd = epoll_create1(0);
-	if(epfd==-1) {
-		perror("epoll_create1");
-		exit(EXIT_FAILURE);
+void accept_connection() {
+	int new;
+	struct sockaddr_in clientname;
+	unsigned int size = sizeof(clientname);
+	new = accept(listenfd, (struct sockaddr *)&clientname, &size);
+	if(new<0) return;
+	if(connfd<0) {
+		dbg("Server: connect from host %s, port %hd.\n", inet_ntoa (clientname.sin_addr), ntohs (clientname.sin_port));
+		connfd=new;
+		conne.events=EPOLLIN;
+		conne.data.fd=connfd;
+		epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &conne);
+	} else {
+		if(serve_policy==serve_last) {
+			dbg("Server: re-connect from host %s, port %hd.\n", inet_ntoa (clientname.sin_addr), ntohs (clientname.sin_port));
+			epoll_ctl(epfd, EPOLL_CTL_DEL, connfd, &conne);
+			close(connfd);
+			connfd=new;
+			conne.events=EPOLLIN;
+			conne.data.fd=connfd;
+			epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &conne);
+		} else { /*if(serve_policy==serve_first)*/
+			dbg("Server: reject connection from host %s, port %hd.\n", inet_ntoa (clientname.sin_addr), ntohs (clientname.sin_port));
+			close(new);
+		}
 	}
+}
+
+void get_signals() {
 	sigset_t mask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
-	if(sigprocmask(SIG_BLOCK, &mask, NULL) == -1) { /* Block signals so that they aren't handled according to their default dispositions */
-		perror("sigprocmask");
-		exit(EXIT_FAILURE);
-	}
+	int ret=sigprocmask(SIG_BLOCK, &mask, NULL);
+	exit_on_error(ret, "sigprocmask");
 	sigfd = signalfd(-1, &mask, 0);
-	if(sigfd==-1) {
-		perror("signalfd");
-		exit(EXIT_FAILURE);
-	}
+	exit_on_error(sigfd, "signalfd");
 	sige.events = EPOLLIN;
 	sige.data.fd = sigfd;
 	epoll_ctl(epfd, EPOLL_CTL_ADD, sigfd, &sige);
-	listenfd=make_sockets(); /* Create the socket and set it up to accept connections. */
-	if(listen(listenfd, 1) < 0) {
-		perror("listen");
-		exit(EXIT_FAILURE);
-	}
-	listene.events = EPOLLIN;
-	listene.data.fd = listenfd;
-	epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &listene);
+}
 
+int main(int argc, char *argv[]) {
+	set_parameters(argc, argv);
+	dbg("%s %s", PROGRAM_NAME, PROGRAM_VERSION);
+	epfd = epoll_create1(0);
+	exit_on_error(epfd,"epoll_create1");
+	get_signals();
+	create_listener();
 	while(true) {
 		struct epoll_event events[MAX_EPOLL_EVENTS];
 		int num_ready = epoll_wait(epfd, events, MAX_EPOLL_EVENTS, 100 /* timeout = 100ms */);
-		if(num_ready==-1) {
-			perror("select");
-			exit(EXIT_FAILURE);
-		}
-		if(num_ready==0) /* timeout processing */
-			make_socketc();
+		exit_on_error(num_ready, "epoll_wait");
+		if(num_ready==0) /* timeout */
+			create_client();
 		for(int i=0;i<num_ready;i++) { /* first pass: look for errors */
 			if((events[i].events & (EPOLLERR|EPOLLRDHUP|EPOLLHUP)) != 0) {
 				if(events[i].data.fd == serverfd) {
-					epoll_ctl(epfd, EPOLL_CTL_DEL, serverfd, &servere);
-					close(serverfd);
-					serverfd=-1; // todo: move in a disconnect_server() function, for all detections. remove redundant connected flag (can test serverfd!=-1)
-					connected=false;
+					disconnect_server();
+				} else if(events[i].data.fd == listenfd) {
+					dbg("listener socket error/disconnection");
+					exit(EXIT_FAILURE);
+				} else if(events[i].data.fd == connfd) {
+					dbg("Server: client disconnected.");
+					epoll_ctl(epfd, EPOLL_CTL_DEL, connfd, &conne);
+					close(connfd);
+					connfd=-1;
 				}
-				// todo: detect here also if client disconnects
 			}
 		}
 		for(int i=0;i<num_ready;i++) { /* second pass: process regular I/O */
@@ -176,35 +212,8 @@ int main(int argc, char *argv[]) {
 					close(listenfd);
 					exit(EXIT_SUCCESS);
 				} else if(events[i].data.fd == listenfd) {
-					int new;
-					struct sockaddr_in clientname;
-					unsigned int size = sizeof(clientname);
-					new = accept(listenfd, (struct sockaddr *)&clientname, &size);
-					if(new<0) {
-						perror("accept");
-						continue;
-					}
-					if(connfd<0) {
-						fprintf(stderr, "Server: connect from host %s, port %hd.\n", inet_ntoa (clientname.sin_addr), ntohs (clientname.sin_port));
-						connfd=new;
-						conne.events=EPOLLIN;
-						conne.data.fd=connfd;
-						epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &conne);
-					} else {
-						if(serve_policy==serve_last) {
-							fprintf(stderr, "Server: re-connect from host %s, port %hd.\n", inet_ntoa (clientname.sin_addr), ntohs (clientname.sin_port));
-							epoll_ctl(epfd, EPOLL_CTL_DEL, connfd, &conne);
-							close(connfd);
-							connfd=new;
-							conne.events=EPOLLIN;
-							conne.data.fd=connfd;
-							epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &conne);
-						} else { /*if(serve_policy==serve_first)*/
-							fprintf(stderr, "Server: reject connection from host %s, port %hd.\n", inet_ntoa (clientname.sin_addr), ntohs (clientname.sin_port));
-							close(new);
-						}
-					}
-				} else if(events[i].data.fd == connfd) { /* data on connected socket */
+					accept_connection();
+				} else if(events[i].data.fd == connfd) { /* data on conn socket */
 					if(read_from_client(connfd)<0) {
 						epoll_ctl(epfd, EPOLL_CTL_DEL, connfd, &conne);
 						close(connfd);

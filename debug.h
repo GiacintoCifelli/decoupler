@@ -128,6 +128,14 @@ extern char log_buffer[LOGBUFFER_SIZE];
 	return ret; \
 })
 
+#define exit_on_error(ret, fmt, arg...) ({ \
+	if(ret<0) { \
+		hdbg(LOG_INFO); \
+		printlog(LOG_INFO, " %d:%s " fmt "\n", errno, strerror(errno), ## arg); \
+		exit(EXIT_FAILURE); \
+	} \
+})
+
 #define checkptr(p) ({ \
 	if(!p) err("pointer null: %s", #p); \
 	p; \
