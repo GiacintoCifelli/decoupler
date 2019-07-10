@@ -1,5 +1,5 @@
 AC_PREREQ(2.60)
-AC_INIT(ka, 1.01)
+AC_INIT(ka, 1.02)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects color-tests])
 AC_CONFIG_HEADERS(config.h)

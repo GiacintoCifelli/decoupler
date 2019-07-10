@@ -20,17 +20,25 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "decoupler.h"
 #include "debug.h"
 #include "parameters.h"
 #include "version.h"
 
-#define MAXMSG		(1024)
+#define MAXMSG			(1024)
+#define MAX_EPOLL_EVENTS	(64)
 
-bool connected = false;
-int epfd, serverfd;
-struct epoll_event servere;
+const char *listen_addr = "127.0.0.1";
+int listen_port = 5555;
+const char *write_addr = "127.0.0.1";
+int write_port = 5000;
+serve_t serve_policy=serve_last;
 
-int make_sockets(uint16_t port) {
+static bool connected = false;
+static int epfd, serverfd;
+static struct epoll_event servere;
+
+static int make_sockets() {
 	int listenfd;
 	struct sockaddr_in name;
 	listenfd=socket(PF_INET, SOCK_STREAM, 0); /* Create the socket. */
@@ -39,7 +47,7 @@ int make_sockets(uint16_t port) {
 		exit (EXIT_FAILURE);
 	}
 	name.sin_family = AF_INET; /* Give the socket a name. */
-	name.sin_port = htons (port);
+	name.sin_port = htons (listen_port);
 	name.sin_addr.s_addr = htonl (INADDR_ANY);
 	if (bind (listenfd, (struct sockaddr *) &name, sizeof (name)) < 0) {
 		perror ("bind");
@@ -52,9 +60,7 @@ int make_sockets(uint16_t port) {
 	return listenfd;
 }
 
-const char *server_address = "127.0.0.1";
-uint16_t server_port = 5000;
-void make_socketc() {
+static void make_socketc() {
 	if(connected)
 		return;
 	struct sockaddr_in serv_addr = {0};
@@ -64,8 +70,8 @@ void make_socketc() {
 		exit (EXIT_FAILURE);
 	}
 	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(server_port);
-	if(inet_pton(AF_INET, server_address, &serv_addr.sin_addr)<=0)
+	serv_addr.sin_port = htons(write_port);
+	if(inet_pton(AF_INET, write_addr, &serv_addr.sin_addr)<=0)
 		return;
 	if(connect(serverfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr))<0)
 		return;
@@ -79,7 +85,7 @@ void make_socketc() {
 	connected=true;
 }
 
-void resend(char *buffer, int nbytes) {
+static void resend(char *buffer, int nbytes) {
 	make_socketc();
 	if(!connected)
 		return; /* and buffer discarded */
@@ -108,19 +114,6 @@ static int read_from_client (int filedes) {
 	return 0;
 }
 
-// project
-// dbg
-// parse_args
-
-typedef enum {
-	serve_first, /* serve the first connected client and reject further connections */
-	serve_last, /* consider the connection dropped unexpectedly and close the previous socket */
-	serve_all /* RFU */
-} serve_t;
-serve_t serve_policy=serve_last;
-
-#define MAX_EPOLL_EVENTS 64
-
 int main(int argc, char *argv[]) {
 	set_parameters(argc, argv);
 	dbg("%s %s", PROGRAM_NAME, PROGRAM_VERSION);
@@ -146,7 +139,7 @@ int main(int argc, char *argv[]) {
 	sige.events = EPOLLIN;
 	sige.data.fd = sigfd;
 	epoll_ctl(epfd, EPOLL_CTL_ADD, sigfd, &sige);
-	listenfd=make_sockets(5555); /* Create the socket and set it up to accept connections. */
+	listenfd=make_sockets(); /* Create the socket and set it up to accept connections. */
 	if(listen(listenfd, 1) < 0) {
 		perror("listen");
 		exit(EXIT_FAILURE);

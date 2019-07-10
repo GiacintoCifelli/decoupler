@@ -14,8 +14,10 @@
 #include "debug.h"
 #include "parameters.h"
 
+#define COMMANDLINE "ka [OPTIONS] listen_ip listen_port write_ip write_port"
+
 static char *ka_description =
-	"Usage: ka [OPTIONS]...\n"
+	"Usage: " COMMANDLINE "\n"
 	"This program configure and drives up to two ofono modems in parallel\n"
 	"It keep them with an active PDP context as much as possible\n"
 	"It normally runs as a demon\n";
@@ -83,9 +85,15 @@ void set_parameters(int argc, char *argv[]) {
 			printf("?? getopt returned character code 0%o ??\n", c);
 		}
 	}
-	if (optind < argc) {
-		printf("ignored additional command line non-option ARGV-elements:\n");
-		while (optind < argc)
-			printf("\t%s\n", argv[optind++]);
+	if(optind!=argc-4) {
+		if(optind<argc-4)
+			printf("too many parameters. Use:\n\t" LRED COMMANDLINE NOCOLOR "\n");
+		if(optind>argc-4)
+			printf("required parameters missing. Use:\n\t" LRED COMMANDLINE NOCOLOR "\n");
+		exit(EXIT_FAILURE);
 	}
+	listen_addr = argv[optind++];
+	listen_port = atoi(argv[optind++]);
+	write_addr = argv[optind++];
+	write_port = atoi(argv[optind++]);
 }
