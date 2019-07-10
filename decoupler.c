@@ -1,25 +1,28 @@
-#include <stdbool.h>
-#include <stdio.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+/* SPDX-License-Identifier: BSD-2-Clause-FreeBSD */
+
+#define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <getopt.h>
 #include <locale.h>
+#include <netdb.h>
 #include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/signalfd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
-//#include "debug.h"
+#include "debug.h"
+#include "parameters.h"
+#include "version.h"
 
 #define MAXMSG		(1024)
 
@@ -119,9 +122,8 @@ serve_t serve_policy=serve_last;
 #define MAX_EPOLL_EVENTS 64
 
 int main(int argc, char *argv[]) {
-	setlocale(LC_ALL,"");
-//	parse_args(argc, argv, config);
-//	dbg("%s %s", PROGRAM_NAME, PROGRAM_VERSION);
+	set_parameters(argc, argv);
+	dbg("%s %s", PROGRAM_NAME, PROGRAM_VERSION);
 	int sigfd, listenfd, connfd=-1, clientfd=-1;
 	struct epoll_event sige, listene, conne, cliente;
 	epfd = epoll_create1(0);
