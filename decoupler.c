@@ -35,8 +35,8 @@ const char *write_addr = "127.0.0.1";
 int write_port = 5000;
 serve_t serve_policy=serve_last; // todo: option for selecting serve_first instead
 
-static int epfd, sigfd, serverfd=-1, listenfd=-1, connfd=-1, clientfd=-1;
-static struct epoll_event servere, listene, sige, conne, cliente;
+static int epfd, sigfd, writefd=-1, listenfd=-1, connfd=-1;
+static struct epoll_event writee, listene, sige, conne;
 
 void set_nonblock(int fd)
 {
@@ -72,49 +72,49 @@ static void create_listener() {
 }
 
 static void create_client() {
-	if(serverfd>=0)
+	if(writefd>=0)
 		return;
 	struct sockaddr_in serv_addr = {0};
-	serverfd=socket(PF_INET, SOCK_STREAM, 0); /* Create the socket. */
-	exit_on_error(serverfd,"socket");
+	writefd=socket(PF_INET, SOCK_STREAM, 0); /* Create the socket. */
+	exit_on_error(writefd,"socket");
 	serv_addr.sin_family = AF_INET;
 	serv_addr.sin_port = htons(write_port);
 	if(inet_pton(AF_INET, write_addr, &serv_addr.sin_addr)<=0) {
-		close(serverfd);
-		serverfd=-1;
+		close(writefd);
+		writefd=-1;
 		return;
 	}
-	if(connect(serverfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr))<0) {
-		close(serverfd);
-		serverfd=-1;
+	if(connect(writefd, (struct sockaddr *)&serv_addr, sizeof(serv_addr))<0) {
+		close(writefd);
+		writefd=-1;
 		return;
 	}
 	uint32_t on=1;
-	setsockopt(serverfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	setsockopt(writefd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 	struct linger a;
 	a.l_onoff=0;
 	a.l_linger=0;
-	setsockopt(serverfd, SOL_SOCKET, SO_LINGER, &a, sizeof(a));
-	servere.events=EPOLLERR|EPOLLRDHUP|EPOLLHUP;
-	servere.data.fd=serverfd;
-	epoll_ctl(epfd, EPOLL_CTL_ADD, serverfd, &servere);
+	setsockopt(writefd, SOL_SOCKET, SO_LINGER, &a, sizeof(a));
+	writee.events=EPOLLERR|EPOLLRDHUP|EPOLLHUP|EPOLLIN;
+	writee.data.fd=writefd;
+	epoll_ctl(epfd, EPOLL_CTL_ADD, writefd, &writee);
 }
 
 static void disconnect_server() {
-	epoll_ctl(epfd, EPOLL_CTL_DEL, serverfd, &servere);
-	close(serverfd);
-	serverfd=-1;
+	epoll_ctl(epfd, EPOLL_CTL_DEL, writefd, &writee);
+	close(writefd);
+	writefd=-1;
 }
 
-static void resend(char *buffer, int nbytes) {
+static void resend(int dest, char *buffer, int nbytes) {
 	create_client();
-	if(serverfd<0) return; /* buffer discarded */
+	if(dest<0) return; /* buffer discarded */
 	int ret;
 	bool finished=false;
 	while(!finished) {
-		ret=write(serverfd, buffer, nbytes);
+		ret=write(dest, buffer, nbytes);
 		if(ret<=0) {
-			disconnect_server();
+			if(dest==writefd) disconnect_server();
 			finished=true;
 		} else if(ret<nbytes) {
 			buffer += ret;
@@ -125,13 +125,13 @@ static void resend(char *buffer, int nbytes) {
 	}
 }
 
-static int read_from_client (int filedes) {
+static int read_from_client(int source, int dest) {
 	char buffer[MAXMSG] = {0};
 	int nbytes;
-	nbytes = read (filedes, buffer, MAXMSG);
+	nbytes = read (source, buffer, MAXMSG);
 	if (nbytes <= 0)
 		return -1;
-	resend(buffer, nbytes);
+	resend(dest, buffer, nbytes);
 	return 0;
 }
 
@@ -191,7 +191,7 @@ int main(int argc, char *argv[]) {
 			create_client();
 		for(int i=0;i<num_ready;i++) { /* first pass: look for errors */
 			if((events[i].events & (EPOLLERR|EPOLLRDHUP|EPOLLHUP)) != 0) {
-				if(events[i].data.fd == serverfd) {
+				if(events[i].data.fd == writefd) {
 					disconnect_server();
 				} else if(events[i].data.fd == listenfd) {
 					dbg("listener socket error/disconnection");
@@ -207,18 +207,20 @@ int main(int argc, char *argv[]) {
 		for(int i=0;i<num_ready;i++) { /* second pass: process regular I/O */
 			if(events[i].events & EPOLLIN) {
 				if(events[i].data.fd == sigfd) {
-					close(serverfd);
+					close(writefd);
 					close(connfd);
 					close(listenfd);
 					exit(EXIT_SUCCESS);
 				} else if(events[i].data.fd == listenfd) {
 					accept_connection();
 				} else if(events[i].data.fd == connfd) { /* data on conn socket */
-					if(read_from_client(connfd)<0) {
+					if(read_from_client(connfd, writefd)<0) {
 						epoll_ctl(epfd, EPOLL_CTL_DEL, connfd, &conne);
 						close(connfd);
 						connfd=-1;
 					}
+				} else if(events[i].data.fd == writefd) { /* data on conn socket */
+					read_from_client(writefd, connfd);
 				}
 			}
 		}
