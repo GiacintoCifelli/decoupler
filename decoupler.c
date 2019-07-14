@@ -7,6 +7,7 @@
 #include <getopt.h>
 #include <locale.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -106,23 +107,31 @@ static void disconnect_server() {
 	writefd=-1;
 }
 
+int write_fd(int fd, void *buf, size_t size) {
+	size_t written = 0;
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = EPOLLOUT | EPOLLERR | EPOLLRDHUP | EPOLLHUP;
+	while(written<size) {
+		int pollret = poll(&pfd, 1, 1); /* block max 1ms, just to check errors */
+		if(pollret<0) {
+			return -1;
+		}  else if (pollret>0) {
+			if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				return -1;
+			} else
+				written += write(fd, buf+written, size-written);
+		}
+	}
+	return written;
+}
+
 static void resend(int dest, char *buffer, int nbytes) {
 	create_client();
 	if(dest<0) return; /* buffer discarded */
-	int ret;
-	bool finished=false;
-	while(!finished) {
-		ret=write(dest, buffer, nbytes);
-		if(ret<=0) {
-			if(dest==writefd) disconnect_server();
-			finished=true;
-		} else if(ret<nbytes) {
-			buffer += ret;
-			nbytes-=ret;
-		}
-		else
-			finished=true;
-	}
+	int ret = write_fd(dest, buffer, nbytes);
+	if(ret<0 && dest==writefd)
+		disconnect_server();
 }
 
 static int read_from_client(int source, int dest) {
